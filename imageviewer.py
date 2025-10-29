@@ -1,12 +1,18 @@
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
+
 import sys
 import keyboard
 import numpy as np
 import threading
 import datetime
 import cv2
+
+#Part2: Import the drawable object interface
+from objects.idrawableobject import InteractDrawableObject
+from objects.rorationrectangle import RotationRectangle
+from notifyobjectcollection import NotifyObjectCollection
 
 class ImageViewer(QGraphicsView):
     mouseClicked = pyqtSignal(QPointF)
@@ -44,8 +50,18 @@ class ImageViewer(QGraphicsView):
 
         self.isPositionSelected = False
         self.currentObject = None
-        self._transform2D = np.eye(3, dtype=np.float32)
         self.locker = threading.Lock()
+
+        # Part2: Drawable object collection
+        self.drawable_object_collection : NotifyObjectCollection[InteractDrawableObject] = NotifyObjectCollection()
+        self.drawable_object_collection.added_item = self.added_item_object_collection
+
+    @property
+    def autoFit(self): return self._autoFit
+    @autoFit.setter
+    def autoFit(self, value): 
+        self._autoFit = value if self._autoFit != value else self._autoFit
+    
 
     def initBegin(self):
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
@@ -61,18 +77,9 @@ class ImageViewer(QGraphicsView):
         self.setRenderHint(QPainter.HighQualityAntialiasing, True)
         self.setRenderHint(QPainter.TextAntialiasing, True)
 
-    @property
-    def autoFit(self): return self._autoFit
-    @autoFit.setter
-    def autoFit(self, value): 
-        self._autoFit = value if self._autoFit != value else self._autoFit
-    
-    @property
-    def isDrawCenter(self): return self._isDrawCenter
-    @isDrawCenter.setter
-    def isDrawCenter(self, value): 
-        self._isDrawCenter = value if self._isDrawCenter != value else self._isDrawCenter
-        self.invalidate()
+    # Part2: Set display for object
+    def added_item_object_collection(self, sender, item):
+        item.display = self
         
     def save_pixmapImage(self):
         try:
@@ -137,6 +144,7 @@ class ImageViewer(QGraphicsView):
     def clearImage(self):
         self._pixmapImage.setPixmap(QPixmap())
 
+    #Part2: adjusting mouse behavior
     def mousePressEvent(self, event):
         self.clicked.emit(self.name)
         if self._pixmapImage is None: return
@@ -145,6 +153,22 @@ class ImageViewer(QGraphicsView):
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         emit_point = self.mapToScene(event.pos())
         self.mouseClicked.emit(emit_point)
+        # Part2
+        if event.button() == Qt.LeftButton:
+            for drawObject in self.drawable_object_collection:
+                if not self.isPositionSelected:
+                    drawObject.selectPoint()
+                if drawObject.is_position_change:
+                    self.isPositionSelected = True
+                    self.currentObject = drawObject
+                    break
+            if not self.isPositionSelected:
+                for drawObject in self.drawable_object_collection:
+                    if not self.isPositionSelected:
+                        drawObject.selectPoint()
+                    if drawObject.is_position_change:
+                        self.isPositionSelected = True
+                        break
         if event.buttons() & Qt.RightButton:
             self.popMenu.exec_(self.mapToGlobal(event.pos()))
         super(ImageViewer, self).mousePressEvent(event)
@@ -153,6 +177,10 @@ class ImageViewer(QGraphicsView):
         if self._pixmapImage is None: return
         emit_point =self.mapToScene(event.pos())
         self.mouseMoving.emit(emit_point)
+        #Part2
+        for drawObject in self.drawable_object_collection:
+            if drawObject.findPoint(emit_point):
+                self.invalidate()
         self.viewport().update()
         super(ImageViewer, self).mouseMoveEvent(event)
 
@@ -161,6 +189,12 @@ class ImageViewer(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         emit_point = self.mapToScene(event.pos())
         self.mouseReleased.emit(emit_point)
+        #Part2
+        if event.button() == Qt.LeftButton:
+            for drawObject in self.drawable_object_collection:
+                drawObject.findPoint(emit_point)
+                drawObject.resetSelectPoint()
+            self.isPositionSelected = False
         super(ImageViewer, self).mouseMoveEvent(event)
     
     def paintEvent(self, event):
@@ -172,6 +206,10 @@ class ImageViewer(QGraphicsView):
         painter.setRenderHint(QPainter.TextAntialiasing, True)
         painter.setTransform(self.viewportTransform())
         if self.transform().m11()<0.01: return
+        #Part2: Check if view has image then do the draw
+        if self.image is not None:
+            for drawingObject in self.drawable_object_collection:
+                drawingObject.draw(painter)
                   
     def invalidate(self):
         self.viewport().update()
@@ -183,13 +221,24 @@ class MainTestWindow(QMainWindow):
         self.setWindowTitle("Image Viewer")
         central_widget = QWidget()
         mainLayout = QHBoxLayout(central_widget)
+        #Part 2: add layout for buttons
+        buttonsLayout = QVBoxLayout()
         self.view = ImageViewer()
         self.view.mouseMoving.connect(lambda location: self.mouse_location(location))
         self.btn_load_image = QPushButton("Load Image")
         self.btn_load_image.clicked.connect(self.load_image_from_file)
-        mainLayout.addWidget(self.btn_load_image)
+        self.btn_show_crop = QPushButton("Show Crop")
+        self.btn_show_crop.clicked.connect(self.show_crop)
+        buttonsLayout.addWidget(self.btn_load_image)
+        buttonsLayout.addWidget(self.btn_show_crop)
+        mainLayout.addLayout(buttonsLayout)
         mainLayout.addWidget(self.view, stretch=1)
         self.setCentralWidget(central_widget)
+
+        #Part2: Add rotation rectangle object into view
+        self.image = None
+        self.rotation_rect = RotationRectangle()
+        self.view.drawable_object_collection.add(self.rotation_rect)
 
     def load_image_from_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -205,12 +254,21 @@ class MainTestWindow(QMainWindow):
     
     def convert_to_qImage(self, image_path):
         opencv_image = cv2.imread(image_path, 0) #0 = gray scale
+        #Part2: store image for crop
+        self.view.image = opencv_image.copy()
         qimage = QImage(opencv_image.data, 
                        opencv_image.shape[1], 
                        opencv_image.shape[0], 
                        opencv_image.strides[0], 
                        QImage.Format_Indexed8) # convert to 8bit image use for gray, binary
         return qimage
+    
+    #Part2
+    def show_crop(self):
+        if self.view.image is not None:
+            roi = self.rotation_rect.getShapeRegion(self.view.image)
+            cv2.imshow("Crop Image", roi)
+            cv2.waitKey(0)
 
     def mouse_location(self, pos):
         self.statusBar().showMessage("X:{0:.3f}, Y:{1:.3f}".format(pos.x(), pos.y()))
